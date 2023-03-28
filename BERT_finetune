@@ -1,0 +1,123 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Sep 14 09:43:24 2022
+
+@author: ArMa
+"""
+
+from transformers import AutoTokenizer
+from transformers import DefaultDataCollator
+import tensorflow as tf
+import datasets
+from datasets import Dataset
+from transformers import TFAutoModelForSequenceClassification,AutoModelForSequenceClassification
+import pandas as pd
+#from plot_hist import plot_hist
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+
+#Hyper-parameters
+Model_name = 'emilyalsentzer/Bio_ClinicalBERT'
+Learning_rate = 5e-5
+Batch_size = 20
+EPOCHES = 20
+N_train = 670
+N_val = 95;
+Fold = 1;
+PATIENCE = 1;
+CONF = [];
+HIST = [];
+#-------------------------------------------------------------------------------------
+#Data loading
+data = pd.read_excel('H:/VTE/HHS_revised_training_data_01182023/OTHER_test/Training_data_sent_keyword.xlsx')
+#-------------------------------------------------------------------------------------
+# Do the fold
+for i in range(Fold):
+    POSITIVE = data[0:956]
+    NEGATIVE = data[956:]
+    POSITIVE = POSITIVE.sample(frac=1).reset_index(drop=True) #shuffle the data
+    NEGATIVE = NEGATIVE.sample(frac=1).reset_index(drop=True) #shuffle the data
+    
+    frames_train = [POSITIVE[0:N_train], NEGATIVE[0:N_train]]
+    frames_train = pd.concat(frames_train)
+    frames_val = [POSITIVE[N_train:N_train+N_val], NEGATIVE[N_train:N_train+N_val]]
+    frames_val = pd.concat(frames_val)
+    frames_test = [POSITIVE[N_train+N_val:], NEGATIVE[N_train+N_val:N_train+N_val+len(POSITIVE[N_train+N_val:])]]
+    frames_test = pd.concat(frames_test)
+    
+    data_train = Dataset.from_dict(frames_train)
+    data_val = Dataset.from_dict(frames_val)
+    data_test = Dataset.from_dict(frames_test)
+    dataset = datasets.DatasetDict({"train":data_train,"val":data_val,"test":data_test})
+    
+    #-------------------------------------------------------------------------------------
+    #Tokenization (BERT tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], padding="max_length", truncation=True)
+    tokenized_datasets = dataset.map(tokenize_function, batched=True)
+    
+    #-------------------------------------------------------------------------------------
+    #Shuffling and preparing for model
+    train_dataset = tokenized_datasets["train"].shuffle(seed=42).select(range(N_train*2))
+    val_dataset = tokenized_datasets["val"].shuffle(seed=42).select(range(N_val*2))
+    test_dataset = tokenized_datasets["test"].shuffle(seed=42).select(range(len(data_test['text'])))
+    
+    data_collator = DefaultDataCollator(return_tensors="tf")
+    
+    tf_train_dataset = train_dataset.to_tf_dataset(
+        columns=["attention_mask", "input_ids", "token_type_ids"],
+        label_cols=["labels"],
+        shuffle=True,
+        collate_fn=data_collator,
+        batch_size=Batch_size,
+    )
+    
+    tf_validation_dataset = val_dataset.to_tf_dataset(
+        columns=["attention_mask", "input_ids", "token_type_ids"],
+        label_cols=["labels"],
+        shuffle=False,
+        collate_fn=data_collator,
+        batch_size=Batch_size,
+    )
+    
+    tf_test_dataset = test_dataset.to_tf_dataset(
+        columns=["attention_mask", "input_ids", "token_type_ids"],
+        label_cols=["labels"],
+        shuffle=False,
+        collate_fn=data_collator,
+        batch_size=1,
+    )
+    
+    #-------------------------------------------------------------------------------------
+    #Training
+    model = TFAutoModelForSequenceClassification.from_pretrained(Model_name, num_labels=2,from_pt=True)
+    #model = TFAutoModelForSequenceClassification.from_pretrained("H:/VTE/models/ClinicalBERT")
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=Learning_rate),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=['accuracy'],
+    )
+    
+    model.summary()
+    es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=PATIENCE)
+    #mc = ModelCheckpoint('H:/VTE/models/ClinicalBERT/best_'+str(i)+'.h5', monitor='val_loss', mode='min', save_best_only=True, verbose=1)
+    print("Fold = "+str(i+1)+"/",str(Fold))
+    with tf.device('/cpu:0'):
+        hist = model.fit(tf_train_dataset, validation_data=tf_validation_dataset, epochs=EPOCHES, callbacks=[es])
+    HIST.append(hist)
+    #model.save_pretrained("H:/VTE/models/BERT")
+    #plot_hist(hist)
+    #-------------------------------------------------------------------------------------
+    #Test and evaluation
+    test_labels_pp = model.predict(tf_test_dataset)
+    test_labels_p = np.argmax(test_labels_pp['logits'],axis = 1)
+    conf_matrix = confusion_matrix(test_dataset['label'], test_labels_p)
+    CONF.append(list(conf_matrix))
+    disp = ConfusionMatrixDisplay(confusion_matrix=conf_matrix,display_labels=['Negative','Positive'])
+    disp = disp.plot(cmap='Reds')  #Blues
+    target_names = ['Negative','Positive']
+    evall = classification_report(test_dataset['label'],test_labels_p, target_names=target_names)
+    print(evall)
+
